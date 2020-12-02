@@ -35,5 +35,12 @@ vignettes/*.pdf
 *.utf8.md
 *.knit.md
 
+*.nb.html
+
 # R Environment Variables
 .Renviron
+
+figures/*
+private_data/*
+stored_fits/*
+downloaded_data/*

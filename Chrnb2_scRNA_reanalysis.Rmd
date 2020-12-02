@@ -1,0 +1,532 @@
+---
+title: "CHRNB2 in striatum - reanalysing data from Muñoz-Manchado et al. 2018 and Gokce et al. 2016"
+output: 
+  html_notebook:
+    toc: TRUE
+---
+
+
+```{r setup}
+library(tidyverse)
+library(brms)
+options(mc.cores = parallel::detectCores())
+rstan::rstan_options(auto_write = TRUE)
+theme_set(cowplot::theme_cowplot())
+
+source(here::here("brms_tools.R"))
+fit_dir <- here::here("stored_fits/")
+if(!dir.exists(fit_dir)) {
+  dir.create(fit_dir)
+}
+downloaded_data_dir <- here::here("downloaded_data/")
+if(!dir.exists(downloaded_data_dir)) {
+  dir.create(downloaded_data_dir)
+}
+figures_dir <- here::here("figures/")
+if(!dir.exists(figures_dir)) {
+  dir.create(figures_dir)
+}
+
+figures_to_save <- list()
+```
+
+
+# Muñoz-Manchado et al. - Dataset A
+
+
+Load and preprocess the data
+
+```{r}
+GSE97478_file <- paste0(downloaded_data_dir,"/GSE97478_Munoz-Manchado_et_al_molecule_count.txt.gz")
+if(!file.exists(GSE97478_file)) {
+  download.file("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE97nnn/GSE97478/suppl/GSE97478_Munoz-Manchado_et_al_molecule_count.txt.gz",GSE97478_file)
+}
+dataA <- read_tsv(gzfile(GSE97478_file), col_types = cols(
+  .default = col_character()
+))
+```
+
+
+```{r}
+dataA_long <- dataA %>%
+  rename(gene = X1) %>%
+  filter(!is.na(gene), !(gene %in% c("cluster","strain", "age", "sex(female=1,male=-1)"))) %>%
+  pivot_longer(cols = -one_of("gene")) %>%
+  mutate(value = as.integer(value))
+
+```
+
+
+## Chrnb2 expression
+
+```{r}
+groups_for_clusters <- function(cluster) {
+  case_when(
+    cluster %in% c("CYCLING", "OPC", "VSM") ~ "Uncategorized",
+    cluster %in% c("ASTRO", "OLIGOS", "ENDO", "MICROGLIA")  ~ "Glia",
+    cluster %in% c("MSND1", "MSND2") ~ "MSN",
+    cluster %in% c("NPY_NGC", "Pvalb", "Th", "Sst", "Pthlh", "CHAT") ~ "Interneurons",
+    TRUE ~ NA_character_)
+}
+
+```
+
+
+```{r}
+chrnb2 <- dataA %>% 
+  rename(row_name = X1) %>%
+  filter(row_name %in% c("cluster", "Chrnb2", "Htr3a")) %>%
+  #t() %>% as.data.frame()
+  pivot_longer(cols = -one_of("row_name")) %>%
+  pivot_wider(names_from = "row_name", values_from = "value") %>%
+  mutate(Chrnb2 = as.integer(Chrnb2), Htr3a = as.integer(Htr3a),
+         cluster = if_else(cluster == "NPY-NGC", "NPY_NGC", cluster))
+```
+
+Expression of Chrnb2 across cell populations from (Munoz-Manchado et al., 2018). Each point is a cell. The color represents the proportion of cells with the given number of transcripts in each population. The cells below the horizontal red line have no Chrnb2 transcripts. The triangle represents an outlier cell that had 13 reads.
+
+```{r, warning=FALSE}
+figures_to_save$expression_munoz_manchado <- chrnb2 %>%
+  mutate(group = groups_for_clusters(cluster),
+         outlier = Chrnb2 > 10,
+         Chrnb2 = if_else(outlier, 6L, Chrnb2)) %>%
+  filter(group != "Uncategorized") %>%
+  group_by(cluster) %>%
+  mutate(total = n()) %>%
+  group_by(cluster, Chrnb2) %>%
+  mutate(dens = n() / total) %>%
+  ggplot(aes(x = cluster, y = Chrnb2, color = dens, shape = outlier, size = outlier)) + geom_jitter(height = 0.3, width = 0.3) +
+  geom_hline(yintercept = 0.5, color = "red") +
+  scale_y_continuous("No. of transcripts (UMI) of Chrnb2") +
+  scale_x_discrete("Cell population") +
+  scale_color_viridis_c("Proportion", labels = scales::percent) +
+  scale_shape_discrete(guide = FALSE) +
+  scale_size_discrete(range = c(2, 4), guide = FALSE) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.3, hjust = 1)) +
+  facet_grid(~group, scales = "free_x", space = "free_x")
+
+figures_to_save$expression_munoz_manchado
+```
+
+In the above we see that Chrnb2 is generally lowly expressed (lots of zeroes in all clusters, the maximal transcript count is `r max(chrnb2$Chrnb2)`), but except for CYCLING and OPC clusters (which have very few cells) all clusters also have some proportion of cells expressing Chrnb2 (but at a low level).
+
+
+We can make a table listing the proportion of cells that have zero UMIs of Chrnb2 (`prop_zero`), mean UMI counts (`mean_expression`), we further list the number of cells in a cluster (`n_cells`) to indicate how much variability would we expect in the results:
+
+```{r}
+chrnb2_table <- chrnb2 %>% 
+  group_by(cluster) %>%
+  summarise(prop_zero = mean(Chrnb2 == 0), mean_expression = mean(Chrnb2), n_cells = n(), 
+            prop_zero_low_CI = qbeta(0.025, 1 + sum(Chrnb2 == 0), 1 + sum(Chrnb2 != 0)),
+            prop_zero_high_CI = qbeta(0.975, 1 + sum(Chrnb2 == 0), 1 + sum(Chrnb2 != 0)),
+            .groups = "drop"
+            ) %>%
+  arrange(prop_zero)
+  
+chrnb2_table %>%
+  select(-prop_zero_low_CI,-prop_zero_high_CI)
+```
+
+## Chrnb2 - statistical analysis
+
+We use a negative binomial model, and use DESeq2 to estimate sizeFactors (e.g. normalization).
+
+```{r}
+dataA_count_matrix <- dataA_long %>% filter(!(gene %in% c("RFP","GFP","2-Mar"))) %>%
+  pivot_wider(names_from = "name", values_from = "value") %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+dde <- DESeq2::DESeqDataSetFromMatrix(dataA_count_matrix, data.frame(x = 1:ncol(dataA_count_matrix)), ~ 1)
+dde <- DESeq2::estimateSizeFactors(dde, type = 'poscounts')
+
+```
+
+
+```{r}
+# Check we got order right
+if(!all(chrnb2$name == names(dde$sizeFactor))) {
+  stop("Name mismatch")
+}
+
+chrnb2_for_model <- chrnb2 %>%
+  mutate(size_factor = dde$sizeFactor) %>%
+  filter(!(cluster %in% c("CYCLING", "OPC", "VSM"))) %>%
+  mutate(group = groups_for_clusters(cluster))
+         
+
+if(any(is.na(chrnb2_for_model$group))) {
+  stop("Bad group assignment")
+}
+```
+
+To let use varying intercepts we use `brms` to fit the model.
+
+```{r}
+dataA_m1 <- brm_with_cache(formula = Chrnb2 ~ (1 || group) + (1 || cluster) + offset(log(size_factor)), family = "negbinomial", data = chrnb2_for_model, control = list(adapt_delta = 0.95), cache_file = paste0(fit_dir,"/dataA_m1.rds"))
+```
+
+Showing summary of model fit
+
+```{r}
+dataA_m1
+```
+
+
+Posterior predictive checks to see if the model fits the dat well.
+
+```{r}
+pp_check(dataA_m1, "bars", nsamples = 50)
+```
+```{r}
+pp_check(dataA_m1, "bars_grouped", group = "group", nsamples = 50)
+```
+```{r}
+pp_check(dataA_m1, "bars_grouped", group = "cluster", nsamples = 50)
+```
+
+No obvious problems in any situation. Especially, the number of zeroes is very well fit by the model.
+
+We may note that the marginal posteriors for the coefficents overlap quite a lot
+
+```{r}
+mcmc_plot(dataA_m1, pars = "r_group\\[")
+```
+but there is a strong positive correlation between the coefficients, so we can expect to be much more certain about between-group differences
+
+```{r}
+bayesplot::mcmc_pairs(dataA_m1, regex_pars = c("r_group\\["))
+```
+
+We then do inference by prediction to account for those correlations in the posterior.
+
+```{r}
+compute_comparison <- function(data_for_comparison) {
+  data_for_comparison <- data_for_comparison %>%
+  mutate(hypo_id = paste0("H", 1:n())) 
+
+
+  hypo_results <- hypothesis(dataA_m1, data_for_comparison$hypo_formula, class = "r")
+  hypo_summary <- hypo_results$samples %>% pivot_longer(everything(), names_to = "hypothesis", values_to = "sample") %>%
+    mutate(exp_sample = exp(sample)) %>%
+    group_by(hypothesis) %>%
+    summarise(lower95 = quantile(0.025, x = exp_sample), 
+              upper95 = quantile(0.975, x = exp_sample),
+              lower50 = quantile(0.25, x = exp_sample),
+              upper50 = quantile(0.75, x = exp_sample),
+              median = median(exp_sample), 
+              one_location = ecdf(exp_sample)(1),
+              CI_excl_one = abs(one_location - 0.5) * 2,
+              .groups = "drop"
+    )
+  
+  comparison_results <- data_for_comparison %>% 
+    inner_join(hypo_summary, by = c("hypo_id" = "hypothesis"))
+  
+  comparison_results
+}
+
+plot_comparison <- function(comparison_results, x_axis, y_axis, facet = facet_wrap(~x), y_label = "Target") {
+  
+  
+  scale_color_linerange <-         scale_color_gradientn("CI excluding 1" , limits = c(0,1), colours = c("#303030","#303030","#0571b0","#ca0020","#ca0020"),
+                                                           values = c(0,0.4,0.6,0.95, 1), breaks = c(0,0.5,0.95),
+                                                           labels = c("0%","50%","95%"))     
+  
+  comparison_results %>% 
+    mutate(y = {{y_axis}}, x = paste0("Baseline - ",{{x_axis}})) %>%
+#      ggplot(aes(color = CI_excl_zero)) + 
+      ggplot() + 
+          geom_vline(xintercept = 1, color = "darkred") +
+          geom_segment(aes(x = lower95, xend = upper95, y = y, yend = y)) + 
+          geom_segment(aes(x = lower50, xend = upper50, y = y, yend = y), size = 2) +
+          scale_x_log10("Fold change") +
+          scale_y_discrete(y_label) +
+          facet 
+}
+```
+
+
+## Chrnb2 - main analysis results
+
+There is reasonable evidence that there is lower overall expression of Chrnb2 in the glia than in both other groups (Interneurons, MSN) with a  fold change at least 2, but little evidence for any other difference (actually, there is mild evidence _against_ fold change > 2 for almost all other comparions).
+
+
+First let us show this graphically - here we show the 50% (thick) and 95% (thin) posterior credible intervals for the difference of a given group (vertical axis) from a baseline group (subplot title). Fold change > 1 means the group on the vertical axis has higher mean expression than the baseline group.
+
+```{r}
+all_groups <- c("Interneurons", "Glia", "MSN")
+group_comparisons <- data.frame(group1 = all_groups) %>%
+   crossing(group2 = all_groups) %>%
+  filter(group1 != group2) %>%
+  mutate(hypo_formula = paste0("group[", group2, ",Intercept] - group[", group1, ",Intercept] > 0"))
+
+groups <- compute_comparison(group_comparisons)
+figures_to_save$group_comparison <- plot_comparison(groups, x_axis = group1, y_axis = group2, facet = facet_wrap(~x, ncol = 1, scales = "free_y"))
+figures_to_save$group_comparison
+```
+
+Showing the same results as a table:
+
+```{r}
+groups %>% 
+  select(group1, group2, lower95, lower50, median, upper50, upper95)
+```
+
+Computing the widest posterior intervals for Glia vs. others
+
+```{r}
+groups %>% 
+  filter(group2 == "Glia") %>%
+  summarise(min_lower_95 = min(lower95), max_upper_95 = max(upper95))
+```
+
+Looking at cluster level - below, we show the fold change comparisons between all non-glia clusters - no evidence of big differences...
+
+```{r, fig.height=6, fig.width=7}
+all_comparisons <- data.frame(cluster1 = unique(chrnb2_for_model$cluster)) %>%
+   crossing(cluster2 = unique(chrnb2_for_model$cluster)) %>%
+   mutate(group1 = groups_for_clusters(cluster1), group2 = groups_for_clusters(cluster2)) %>% filter(cluster1 != cluster2) %>%
+  mutate(hypo_formula = paste0("group[", group2, ",Intercept] + cluster[", cluster2, ",Intercept] - group[", group1, ",Intercept] - cluster[", cluster1, ",Intercept] > 0"))
+
+nonglia_vs_nonglia <- compute_comparison(all_comparisons %>% filter(group1 != "Glia", group2 != "Glia"))
+plot_comparison(nonglia_vs_nonglia, x_axis = cluster1, y_axis = cluster2)
+```
+
+Similarly, when we look within glia no big changes.
+
+```{r}
+glia_vs_glia <- compute_comparison(all_comparisons %>% filter(group1 == "Glia", group2 == "Glia"))
+plot_comparison(glia_vs_glia, x_axis = cluster1, y_axis = cluster2)
+```
+
+Compute the widest CIs for all "within group" comparisons:
+
+```{r}
+rbind(glia_vs_glia, nonglia_vs_nonglia) %>%
+  summarise(min_lower_95 = min(lower95), max_upper_95 = max(upper95),max_lower_95 = max(lower95), min_upper_95 = min(upper95))
+```
+
+
+
+
+# Muñoz-Manchado et al. - Dataset B
+
+Dataset B contains only striatal cells.
+
+```{r}
+dataB_file <- paste0(downloaded_data_dir, "/GSE106707_expression_data.tab.gz")
+if(!file.exists(dataB_file)) {
+  download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE106707&format=file&file=GSE106707%5Fexpression%5Fdata%2Etab%2Egz", dataB_file)
+}
+                     
+                     
+dataB <- read_tsv(gzfile(dataB_file), col_types = cols(
+  .default = col_double(),
+  cellid = col_character()
+)) %>%
+  rename(gene = cellid)
+
+annotation_file <- paste0(downloaded_data_dir, "/cell_annotation_WG_striatum_FinalCluster_Pvalb_20oct2017 caro.xlsx")
+if(file.exists(annotation_file)) {
+  annotationB <- readxl::read_excel(annotation_file)
+  has_annotation <- TRUE
+} else {
+  warning(paste0("Annotation file '", annotation_file, "' not found. \n We got the file by e-mail from authors of the Munoz-Manchado paper, namely from Jens Hjerling-Leffler who was very helpful.\n"))
+  warning("We will use our 'guesses' for annotations instead.\n")
+  has_annotation <- FALSE
+}
+
+```
+
+
+
+
+```{r}
+
+#genes_of_interest <- c(
+dataB_long_raw <-  dataB %>%
+  #t() %>% as.data.frame()
+  pivot_longer(cols = -one_of("gene")) 
+
+dataB_t <- dataB_long_raw %>%
+  pivot_wider(names_from = "gene", values_from = "value")
+
+if(has_annotation) {
+  annotationB_brief <- annotationB %>% transmute(name = cellid, cluster = grLev2)
+  dataB_t <- dataB_t %>% inner_join(annotationB_brief, by = "name")
+} else {
+  dataB_t <- dataB_t %>% mutate(
+    #Our quick guesses for cell populations
+    cluster = case_when(Ppp1r1b > 0 ~ "Ppp1r1b",
+                              Bcl11b > 0 ~ "Bcl11b",
+                              Npy > 10 ~ "Npy",
+                              Sst > 10 ~ "Sst",
+                              Pthlh > 5 ~ "Pthlh",
+                              Pvalb > 3 ~ "Pvalb",
+                              Chat > 0 ~ "Chat",
+                              Gad1 > 5 ~ "Gad1",
+                              TRUE ~ "Uncertain"))
+}
+
+```
+
+
+Let's look at Chrnb2 expression for each cluster (cell population), we show a histogram for each. We see that across all populations, 0 is the dominant expression level.
+
+```{r}
+dataB_t %>% ggplot(aes(x = Chrnb2)) + geom_histogram(binwidth = 1) + facet_wrap(~cluster)
+```
+
+We can also look at the proportion of zeroes per "cluster":
+
+```{r}
+dataB_t %>%
+  group_by(cluster) %>%
+  summarise(prop_zero = mean(Chrnb2 == 0), num_cells = n(), .groups = "drop") %>%
+  arrange(desc(prop_zero))
+
+```
+
+
+
+Overall, this dataset is not very informative (too many zeroes), this is at least in part due to normalization applied by the authors, which could have converted a lot of small counts to zeroes. The only thing that can be learned is that Chrnb2 is not exclusive to any population, neither does some population express Chrnb2 in very large amounts.
+
+# Gokce et al.
+
+The Gokce et al. dataset was enriched for MSN neurons. 
+
+```{r}
+gokce_et_al_file <- paste0(downloaded_data_dir, "/GSE82187_cast_all_forGEO.csv.gz")
+if(!file.exists(gokce_et_al_file)) {
+  download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE82187&format=file&file=GSE82187%5Fcast%5Fall%5FforGEO%2Ecsv%2Egz", gokce_et_al_file)
+}
+
+
+Gokce_et_al <- read_csv(gzfile(gokce_et_al_file), col_types = cols(
+  .default = col_double(),
+  cell.name = col_character(),
+  type = col_character(),
+  experiment = col_character(),
+  protocol = col_character()
+)) 
+Gokce_et_al_filtered <- Gokce_et_al %>% select(cell.name, type, experiment, protocol, Chrnb2, Ppp1r1b, Bcl11b,Sst, Npy, Pthlh,Pvalb,Chat,Gad1)
+
+
+```
+
+Let us look at Chrnb2 expression across all cell populations in the Gokce data.
+
+```{r}
+Gokce_et_al_filtered %>% #pivot_longer(c("Chrnb2", "Ppp1r1b", "Bcl11b","Sst")) %>% 
+  ggplot(aes(x = Chrnb2)) + geom_histogram(binwidth = 1) + facet_wrap(~type)
+```
+It appears Chrnb2 is only expressed in Neurons (but only around half of neurons have detectable expression - this is not very surprising due to the large noise in most scRNA-seq datasets).  Since most neurons in this dataset are MSNs, it is likely that MSNs express Chrnb2
+
+
+Chrnb2 is also not particularly lowly expressed. The mean expression of Chrnb2 is:
+
+```{r}
+Gokce_et_al_filtered %>% filter(type == "Neuron") %>% pull(Chrnb2) %>% mean()
+```
+
+Not many genes are expressed much more than Chrnb2, we group genes by mean expression in neurons only into categories and we see that mean expression > 2 is quite rare.
+
+```{r}
+
+#names(Gokce_et_al)
+Gokce_et_al_long <- Gokce_et_al %>% pivot_longer(-one_of("X1", "cell.name", "type", "experiment", "protocol")) 
+Gokce_et_al_expression_categories <- Gokce_et_al_long %>% filter(type == "Neuron") %>%
+  group_by(name) %>% summarise(mean_expression = mean(value), expression_category = cut(mean_expression, breaks = 0:6, right = FALSE))
+
+
+#max(tt$mean_expression)
+Gokce_et_al_expression_categories %>% group_by(expression_category) %>% summarise(count = n())
+
+```
+
+# Ho et al.
+
+```{r}
+ho_et_al_file <- paste0(downloaded_data_dir, "/GSE112177_processed_data_tpm.txt.gz")
+if(!file.exists(ho_et_al_file)) {
+  download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE112177&format=file&file=GSE112177%5Fprocessed%5Fdata%5Ftpm%2Etxt%2Egz", ho_et_al_file)
+}
+ho_et_al_tpm <- read_tsv(gzfile(ho_et_al_file), col_types = cols(
+  .default = col_double(),
+  X1 = col_character()
+)) %>%
+  rename(gene = X1)
+```
+
+```{r}
+ho_et_al_tpm_long <-  ho_et_al_tpm %>%
+  #t() %>% as.data.frame()
+  pivot_longer(cols = -one_of("gene")) 
+
+ho_et_al_tpm_t <- ho_et_al_tpm_long %>%
+  pivot_wider(names_from = "gene", values_from = "value") 
+
+```
+
+Ho et al. didn't provide any classification of cell types, so we use three possible markers that were present in the data.
+
+```{r}
+ho_et_al_tpm_t <- ho_et_al_tpm_t %>% mutate(
+  cluster_guess = paste(if_else(Bcl11b > 10, "Bcl11b", ""),
+                          #  Npy > 10 ~ "Npy", #Cnpy2 - 4 Npy1r, Npy5r
+                            #Sst > 10 ~ "Sst", # only 1 non-zero
+                            #Pthlh > 5 ~ "Pthlh", # not present
+                           # Pvalb > 3 ~ "Pvalb", # only 1 non-zero
+                           if_else(Chat > 0, "Chat", "") ,
+                           if_else(Gad1 > 5, "Gad1", ""))
+)
+```
+
+Plot Chrnb2 expression per cell population (we look at all 8 combinations of expressing/not expressing the 3 markers). 
+
+```{r}
+base_hist <- ho_et_al_tpm_t %>% ggplot(aes(x = Chrnb2)) + geom_histogram(breaks = c(-10, seq(1, 70, length.out = 10)))
+
+#base_hist
+base_hist + facet_wrap(~cluster_guess)
+
+```
+Once again, we see mostly zeroes, but all populations that larger number of cells also have some cells expressing Chrnb2.
+
+```{r}
+ho_et_al_tpm_t %>% group_by(cluster_guess) %>% summarise(count = n(), mean_ch = mean(Chrnb2), mean_log= (mean(log(Chrnb2 + 0.5))), .groups = "drop")
+```
+# Save figures for manuscript
+
+
+```{r}
+for(type in c(".svg")) {
+  for(plot_name in names(figures_to_save)) {
+    # if(!is.null(widths[[plot_name]])) {
+    #   width = widths[[plot_name]]
+    # } else {
+    #   width = three_groups_width
+    # }
+    ggsave(paste0(figures_dir,"/", plot_name, type), figures_to_save[[plot_name]])
+           #, width = width, height = base_height)
+  }
+}
+
+```
+
+```{r}
+inkscape_path <-'C:/Program Files/Inkscape/inkscape.exe'
+if(!file.exists(inkscape_path)) {
+  warning("Could not find inkscape, will not convert to .wmf")
+} else {
+  for(plot_name in names(figures_to_save)) {
+    input_file <- paste0(figures_dir,"/", plot_name, ".svg")
+    output_file <- paste0(figures_dir,"/", plot_name, ".wmf")
+    system(paste0('"', inkscape_path,'"', ' --file "', input_file, '" --export-ignore-filters --export-wmf "', output_file, '"'))
+  }
+}
+
+```
+
+

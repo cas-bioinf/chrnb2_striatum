@@ -1,0 +1,120 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Munoz Manchado
+
+Count of GFP and RFP marked cells in the whole dataset:
+
+```{r}
+dataA_long %>% filter(gene %in% c("GFP", "RFP")) %>%
+  ggplot(aes(x = value)) + geom_histogram(binwidth = 1) + facet_wrap(~gene) +
+  scale_x_continuous(breaks = c(0,1))
+  
+```
+
+```{r}
+dataA_counts <- dataA_long %>% group_by(name) %>%
+  summarise(total_expression = sum(value)) 
+```
+
+Distribution of total expression (UMIs) per cell:
+
+```{r}
+dataA_counts %>%
+  ggplot(aes(x = total_expression)) + geom_histogram(bins = 30)
+
+```
+Minimal total expression (methods says they removed all cells with < 1500 UMIs).
+
+```{r}
+dataA_counts %>%
+  pull(total_expression) %>% min()
+
+```
+
+Additionally, we can compute the uncertainty for proportion of cells with no transcripts as 95% credible intervals directly, this is _very rough_ but we would expect the "true" proportion of zeroes (i.e. how many zeroes there would be if we could sequence infinite cells) to lie somewhere between `prop_zero_low_CI` and `prop_zero_high_CI`.
+
+```{r}
+chrnb2_table %>%
+  select(cluster, prop_zero_low_CI, prop_zero_high_CI)
+```
+
+We see that there is huge overlap between the credible intervals for most pairs of clusters. 
+
+## Htr3a
+
+We wanted also look at expression of Htr3a:
+
+```{r}
+chrnb2 %>%
+  ggplot(aes(x = cluster, y = Htr3a)) + geom_jitter(height = 0.3, width = 0.3, alpha = 0.5) +
+  geom_hline(yintercept = 0.5, color = "red") +
+  scale_y_continuous("No. of transcripts (UMI) of Htr3a") +
+  theme(axis.text.x = element_text(angle = 270))
+
+```
+
+Trying to look for correlations between log expression of Htr3a and Chrnb2, it is not very convincing (note that most cells have zero reads for both genes). Each point is a cell (once again with some jitter), the blue line is a linear fit:
+
+```{r}
+chrnb2 %>%
+  #group_by(Chrnb2, Htr3a) %>%
+  #summarise(count = n()) %>%
+  group_by(cluster) %>%
+  filter(n() > 20 | cluster == "NPY-NGC") %>%
+  ggplot(aes(x= log(Chrnb2 + 0.5), y = log(Htr3a + 0.5))) + geom_jitter(width = 0.1, height = 0.1, alpha = 0.2) + geom_smooth(method = "lm", formula = y ~ x)
+```
+We can also do a separate plot per cluster, but once again it is not very convincing:
+
+```{r}
+chrnb2 %>%
+  #group_by(Chrnb2, Htr3a) %>%
+  #summarise(count = n()) %>%
+  group_by(cluster) %>%
+  filter(n() > 20 | cluster == "NPY-NGC") %>%
+  ggplot(aes(x= log(Chrnb2 + 0.5), y = log(Htr3a + 0.5))) + geom_jitter(alpha = 0.2) + geom_smooth(method = "lm", formula = y ~ x) + facet_wrap(~cluster)
+```
+
+
+## Stats analysis
+
+```{r}
+non_glia_vs_glia <- compute_comparison(all_comparisons %>% filter(group1 != "Glia", group2 == "Glia"))
+plot_comparison(non_glia_vs_glia, x_axis = cluster1, y_axis = cluster2)
+```
+
+# Data B
+
+```{r}
+```
+
+Looking at fluorescence marker distribution
+
+```{r}
+hist(dataB_t$`marker-DsRed`)
+hist(dataB_t$`marker-GFP`)
+```
+Looking at overall distribution of some marker gene counts
+
+```{r}
+dataB_long %>% filter(tolower(gene) %in% tolower(c("Npy", "Sst", "Htr3a"))) %>%
+  ggplot(aes(x = value)) + geom_histogram(bins = 20) + facet_wrap(~gene, scales = "free_x")
+```
+Histogram of total reads - this looks a lot like the data are after normalization.
+
+```{r}
+dataB_long %>% group_by(name) %>%
+  summarise(total_reads = sum(value)) %>% pull(total_reads) %>% hist()
+```
+We will do some hacky "cluster guesses" - putting cells to clusters based on thresholding expression of few genes. 
+
+# Gokce et al
+
+Let us look at expression of some marker genes (and Chrnb2), in neural cells conly. The interesting thing is that except for Chrnb2, all the genes are either expressed in almost all cells or not expressed in almost all cells, i.e. we can't further split the neurons by those markers.
+
+```{r}
+Gokce_et_al_filtered %>% filter(type == "Neuron") %>% pivot_longer(-one_of(c("cell.name", "type", "experiment", "protocol"))) %>% 
+  ggplot(aes(x = value)) + geom_histogram(binwidth = 1) + facet_wrap(~name)
+```
