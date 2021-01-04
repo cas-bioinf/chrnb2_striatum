@@ -1,0 +1,458 @@
+---
+title: "Additional behavioral tasks analysis"
+output: 
+  html_notebook:
+    toc: TRUE
+---
+
+```{r setup, message = FALSE, warning = FALSE, results = "hide"}
+library(readxl)
+library(here)
+library(rstanarm)
+library(brms)
+library(MASS)
+library(tidyverse)
+
+fit_dir <- here::here("stored_fits/")
+if(!dir.exists(fit_dir)) {
+  dir.create(fit_dir)
+}
+
+
+theme_set(cowplot::theme_cowplot())
+
+options(mc.cores = parallel::detectCores())
+```
+
+# Head dippings
+
+Reading the data:
+
+```{r}
+head_c1 <- read_excel(here("private_data", "Hole board cohort 1.xlsx"), 
+                      sheet = "Number of head dippings",
+                      range = "A4:B20") %>% 
+  rename(mouse = ctrl, n_dippings = `Total number of head dippings`) %>% 
+  filter(!(mouse %in% c("average","mt") )) %>% 
+  mutate(group = c(rep("ctrl", 10), rep("mt", 4)), cohort = "1")
+
+head_c2 <- read_excel(here("private_data", "Hole board test_cohort 2.xlsx"), 
+                      sheet = "Number of head dippings",
+                      range = "A4:E25") %>% 
+  select(-Jakub, -Revan, -ratio) %>%
+  rename(mouse = ctrl, n_dippings = `Re-scoring Helena`) %>% 
+  filter(!(mouse %in% c("average","mt") ), !is.na(n_dippings)) %>% 
+  mutate(group = c(rep("ctrl", 6), rep("mt", 11)), cohort = "2")
+
+head_all <- rbind(head_c1, head_c2)
+```
+
+First fit a Poison GLM and do a posterior predictive check (PP check) for standard deviation. We want the observed value ($y$ in the plot) to be within the posterior uncertainty predicted by the model ($y_{rep}$ in the plot). When this is not the case, it indicates a mismatch between the model and data.
+
+```{r}
+fit_head_pois_stan <- stan_glm(n_dippings ~ group, data = head_all, family = "poisson")
+pp_check(fit_head_pois_stan, plotfun = "stat_grouped", stat = "sd", group = "group", binwidth = 1)
+```
+
+The PP check clearly shows that the standard deviation is underestimated by the Poisson model. 
+We try a negative binomial GLM next with the same PP check. 
+
+```{r}
+fit_head_nb_stan <- stan_glm.nb(n_dippings ~ group, data = head_all)
+pp_check(fit_head_nb_stan, plotfun = "stat_grouped", stat = "sd", group = "group", binwidth = 10)
+
+```
+
+We will also do PP check for means across both cohorts and groups to check for
+possible drift between cohorts.
+
+```{r}
+bayesplot::ppc_stat_grouped(head_all$n_dippings, posterior_predict(fit_head_nb_stan, summary = FALSE), group = interaction(head_all$cohort, head_all$group), stat = "mean", binwidth = 10)
+```
+
+
+Both checks look reasonable. Let us look at the summary of the model coefficients:
+
+```{r}
+summary(fit_head_nb_stan, probs = c(0.025,0.975))
+```
+
+This gives us the following credible interval for fold change between control and treatment:
+
+```{r}
+sum_head_nb_stan <- summary(fit_head_nb_stan, probs = c(0.025,0.975))
+ci_head_nb_stan <- sum_head_nb_stan["groupmt", c("2.5%", "97.5%")]
+exp(ci_head_nb_stan)
+```
+To compare we also run a frequentist negative binomial GLM:
+
+```{r}
+fit_head_nb <- glm.nb(n_dippings ~ group, data = head_all)
+summary(fit_head_nb)
+```
+
+This results in a confidence interval very close to the credible interval from the
+Bayesian model:
+
+```{r}
+exp(confint(fit_head_nb)["groupmt",])
+
+```
+In both cases we cannot strongly constrain the between-group difference, although more than 20% decrease in the treatment group is not consistent with the data.
+
+# Nest building
+
+There was a mild discrepancy in the total amount of nest building material available
+between the 3 cohorts of the experiment - cohorts 2 and 3 had 3 grams available while
+cohort 1 had just 2.8 grams. But since no mouse in cohort 1 used anything near of the 2.8 limit,
+it is sensible to treat the upper limit as 3 for all cohorts.
+
+```{r}
+read_single_condition_nest <- function(column, cohort) {
+  control_range = paste0(column, "4:", column, "13")
+  control <- read_excel(here("private_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
+                        range = control_range, col_names = "amount", col_types = "numeric") %>%
+    mutate(group = "control")
+
+  cre_range = paste0(column, "15:", column, "25")
+  cre <- read_excel(here("private_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
+                        range = cre_range, col_names = "amount", col_types = "numeric") %>%
+    mutate(group = "cre")
+  
+  rbind(control, cre) %>%
+    filter(!is.na(amount)) %>%
+    mutate(cohort = !!cohort)
+}
+nest <- rbind(
+  read_single_condition_nest("B", 1),
+  read_single_condition_nest("E", 2),
+  read_single_condition_nest("H", 3),
+  read_single_condition_nest("K", 4)
+) %>% mutate(
+  proportion = amount/3,
+  cohort = factor(cohort)
+)
+
+```
+
+
+This is how the data looks like:
+
+```{r}
+nest %>% ggplot(aes( x = group, y = amount, color = cohort, shape = cohort)) + 
+  geom_boxplot(aes( x = group, y = amount, group = group), inherit.aes = FALSE, width = 0.1, color = "black") + geom_jitter(width = 0.3, height = 0, size = 2, alpha = 0.8)
+```
+
+
+We fit a zero-one inflated Beta model to the proportion of the material used using the `brms` package. 
+The parametrization of the model in `brms` is that there is a Beta component parametrized by mean and precision (`phi`) and
+there is a parameter `zoi` corresponding to the probability of getting a zero OR one and a parameter `coi` corresponding to the probability of getting one, conditional on `zoi`. We let the `zoi` parameter vary per group.
+
+```{r}
+fit_nest_inf_beta <- brm(bf(proportion ~ group, zoi ~ group), data = nest, family = zero_one_inflated_beta(), file = paste0(fit_dir, "/nest_inf_beta.rds"))
+```
+
+We then run a battery of PP checks to see if the model is sensible:
+
+```{r}
+pp_check(fit_nest_inf_beta, nsamples = 30) + ggtitle("Overall density")
+
+```
+
+
+```{r}
+pp_check(fit_nest_inf_beta, type = "stat_grouped", stat = "sd", group = "group", nsamples = 4000, binwidth = 0.01) + ggtitle("Standard deviation per group")
+
+```
+
+
+```{r}
+pred_nest <- posterior_predict(fit_nest_inf_beta, summary = FALSE)
+```
+```{r}
+bayesplot::ppc_stat_grouped(nest$proportion, pred_nest, group = nest$cohort, stat = "mean", binwidth = 0.01) + ggtitle("Mean per cohort")
+```
+
+
+```{r, message=FALSE}
+zero_bars_scale <- scale_x_continuous(breaks = c(0,1), labels = c("Non-zero", "Zero"))
+bayesplot::ppc_bars_grouped(as.numeric(nest$proportion == 0) , matrix(as.numeric(pred_nest == 0), nrow = nrow(pred_nest), ncol = ncol(pred_nest)), group = nest$cohort) + ggtitle("Number of zero and non-zero proportions per cohort") + zero_bars_scale
+
+```
+
+
+```{r, message=FALSE}
+bayesplot::ppc_bars_grouped(as.numeric(nest$proportion == 0) , matrix(as.numeric(pred_nest == 0), nrow = nrow(pred_nest), ncol = ncol(pred_nest)), group = nest$group) + ggtitle("Proportion of zeroes per group") + zero_bars_scale
+```
+
+
+```{r}
+bayesplot::ppc_stat_grouped(nest$proportion, pred_nest, group = nest$cohort, stat = "sd", binwidth = 0.01) + ggtitle("Standard deviation per cohort")
+```
+
+
+```{r}
+bayesplot::ppc_stat_grouped(nest$proportion, pred_nest, group = interaction(nest$group, nest$cohort), stat = "mean", binwidth = 0.01) + ggtitle("Mean per group and cohort")
+
+```
+We found no big discrepancies between the model and data. So we can proceed to summarise the fit.
+
+
+```{r}
+fit_nest_inf_beta
+```
+It is somewhat hard to interpret the model coefficients directly, especially since increased `zoi` means increase of both zeroes AND ones. So we use model predictions for inference, investigating the posterior distribution of the difference between the means of the two groups
+and summarising it by a 95% credible interval.
+
+```{r}
+preds_nest <- posterior_epred(fit_nest_inf_beta, newdata = data.frame(group = c("control", "cre")))
+diffs <- preds_nest[,2] - preds_nest[, 1]
+quantile(diffs, c(0.025,0.975))
+```
+
+So the data are consistent with up to 20% increase and a very small decrease in mean utilization of nest building material.
+
+
+
+# Forced swimming
+
+Read the data:
+
+```{r}
+swim <- read_excel(here("private_data", "FST cohort 1-4.xlsx"), sheet = "Sheet1", range = "A2:B34") %>%
+  pivot_longer(everything(), names_to = "group", values_to = "time") %>% filter(!is.na(time)) %>%
+  mutate(group = factor(group, levels = c("ctrl", "Beta2-del")))
+```
+
+Let us plot the data:
+
+```{r}
+swim %>% ggplot(aes(x = group, y = time)) + geom_boxplot(width = 0.1) + geom_jitter(width = 0.3, height = 0, size = 2, alpha = 0.8)
+```
+We fit a lognormal linear model with `brms` and perform some PP checks to asses model fit.
+
+```{r}
+fit_swim_stan <- brm(time ~ group, data = swim, family = "lognormal", file = paste0(fit_dir, "/swim_lognormal.rds"))
+```
+
+
+```{r}
+pp_check(fit_swim_stan, type = "stat_grouped", stat = "sd", group = "group", binwidth = 5, nsamples = 4000)
+```
+
+We see that the model has some trouble fitting the sd of the groups.
+
+```{r}
+pp_check(fit_swim_stan, type = "dens_overlay", nsamples = 30)
+```
+
+
+The density check also shows the model slightly off the data.
+
+```{r}
+fit_swim_stan
+```
+
+We thus test a gamma model and run the same checks:
+
+```{r}
+fit_swim_stan_gamma <- brm(time ~ group, data = swim, family = Gamma(link = "log"), file = paste0(fit_dir, "/swim_gamma.rds"))
+pp_check(fit_swim_stan_gamma, type = "stat_grouped", stat = "sd", group = "group", binwidth = 5,  nsamples = 4000)
+pp_check(fit_swim_stan_gamma, type = "dens_overlay", nsamples = 30)
+
+```
+
+The plots look a little bit better, but the difference is not big. Nevertheless the fitted coefficients are almost identical, so we do not need to worry about this modelling choice too much.
+
+```{r}
+fit_swim_stan_gamma
+```
+Finally, we run a frequentist version of the models, also giving us almost the same inferences. 
+
+```{r}
+fit_swim_glm <- glm(time ~ group, family = Gamma(link = "log"), data = swim)
+summary(fit_swim_glm)
+```
+
+This is the 95% CI for the ratio of times in the gamma frequentist model:
+
+```{r}
+exp(confint(fit_swim_glm)["groupBeta2-del",])
+```
+
+
+```{r}
+fit_swim_glm_2 <- glm(time ~ group, family = gaussian(link = "log"), data = swim)
+summary(fit_swim_glm_2)
+```
+This is the 95% CI for the log-normal frequentist model:
+
+```{r}
+exp(confint(fit_swim_glm_2)["groupBeta2-del",])
+```
+In either case, we can rule out large (roughly more than 20%) changes.
+
+# Social preference
+
+The data represent examining times for mouse and an inanimate object.
+
+```{r}
+examining_raw <- read_excel(here("private_data", "Examining times cohort 1 to 4.xlsx"), sheet = "Sheet1", range = "A2:K34", na = c("", "missing video?")) %>%    
+  transmute(cre.object = `examining object...3`,
+            cre.mouse = `examining mouse...2`,
+            control.object = `examining object...10`,
+            control.mouse = `examining mouse...9`,
+            cre.id = cre,
+            control.id = ctrl)
+
+examining_longer_spec <- data.frame(.name = c("cre.id", "control.id", "cre.object", "control.object", "cre.mouse", "control.mouse"), .value = rep(c("id", "object", "mouse"), each = 2), group = rep(c("cre", "control"), 3)
+                             )
+
+
+examining <- examining_raw  %>%
+  pivot_longer_spec(examining_longer_spec) %>%
+  filter(!is.na(object), !is.na(mouse)) %>%
+  mutate(mo_ratio = mouse/object)
+```
+
+## Object
+
+Let us plot the examination times for the object:
+
+```{r}
+examining %>% ggplot(aes(x = group, y = object)) + geom_boxplot(width = 0.1, outlier.shape = NA) + geom_jitter(width = 0.3, height = 0, size = 2, alpha = 0.8)
+```
+Once again, we fit both lognormal and gamma models and do some checks.
+
+```{r}
+fit_object_stan <- brm(object ~ group, data = examining, family = "lognormal", file = paste0(fit_dir, "/object_lognormal.rds"))
+```
+
+```{r}
+pp_check(fit_object_stan, type = "stat_grouped", stat = "sd", group = "group", binwidth = 1, nsamples = 4000)
+pp_check(fit_object_stan, type = "dens_overlay", nsamples = 30)
+```
+
+
+```{r}
+fit_object_stan
+```
+
+
+```{r}
+fit_object_stan_gamma <- brm(object ~ group, data = examining, family = Gamma(link = "log"), file = paste0(fit_dir, "/object_gamma.rds"))
+```
+
+```{r}
+pp_check(fit_object_stan_gamma, type = "stat_grouped", stat = "sd", group = "group", binwidth = 1, nsamples = 4000)
+pp_check(fit_object_stan_gamma, type = "dens_overlay", nsamples = 30)
+```
+
+
+```{r}
+fit_object_stan_gamma
+```
+
+
+The model fits and the fitted coefficients are very similar. The same can be said for fitting frequentist versions of the models:
+
+```{r}
+fit_object <- glm(object ~ group, data = examining, family = Gamma(link = "log"))
+summary(fit_object)
+```
+The CI for the gamma model:
+
+```{r}
+exp(confint(fit_object)["groupcre",])
+```
+
+
+```{r}
+fit_object_2 <- glm(object ~ group, data = examining, family = gaussian(link = "log"))
+summary(fit_object_2)
+
+```
+
+The CI for the lognormal model:
+
+```{r}
+exp(confint(fit_object_2)["groupcre",])
+
+```
+In all cases we have good evidence for at least 15% increase in the treated condition. 
+
+## Mouse
+
+Let us now investigate the mouse examination times in the same way
+
+```{r}
+examining %>% ggplot(aes(x = group, y = mouse)) + geom_boxplot(width = 0.1, outlier.shape = NA) + geom_jitter(width = 0.3, height = 0, size = 2, alpha = 0.8)
+```
+
+```{r}
+examining <- examining %>% mutate(mouse = if_else(mouse == 0,0.001, mouse))
+```
+
+We skip fitting the Bayesian models as they gave almost the same inferences as the frequentist ones.
+
+```{r}
+fit_mouse <- glm(mouse ~ group, data = examining, family = Gamma(link = "log"))
+summary(fit_mouse)
+```
+
+The 95% CI for the gamma model is:
+
+```{r}
+exp(confint(fit_mouse)["groupcre",])
+
+```
+
+
+```{r}
+fit_mouse_2 <- glm(mouse ~ group, data = examining, family = gaussian(link = "log"))
+summary(fit_mouse_2)
+```
+
+The 95% CI for the log-normal model is:
+
+```{r}
+exp(confint(fit_mouse_2)["groupcre",])
+```
+In both cases we get evidence against large change.
+
+## Ratio
+
+Finally, we look at the mouse/object ratio. Since all our models work on the log scale, the ratio of mouse/object ratios between the conditions corresponds to the (negation of) the interaction additive term on the log scale.
+
+```{r}
+examining_longer <- examining %>% select(-mo_ratio) %>%
+  pivot_longer(one_of(c("mouse", "object")), names_to = "type", values_to = "time") 
+  
+
+
+fit_mo_ratio_long <- glm(time ~ group * type, data = examining_longer, family = Gamma(link = "log"))
+summary(fit_mo_ratio_long)
+```
+
+Just to verify this reasoning, we note that logarithm of the mouse/object ratio in the control group corresponds to:
+```
+Intercept - (Intercept + typeobject) = -typeobject
+```
+
+The logarithm of the mouse/object ratio in the treatment group is:
+```
+(I + groupcre) - (I + groupcre + typeobject + groupcre:typeobject) = -typeobject - groupcre:typeoboject
+```   
+
+So to get the logarithm of the ratio of ratios we need to subtract those two terms, giving us:
+```
+(-typeboject - groupcre:typeobject) - (-typeobject) = -groupcre:typeobject
+```
+
+The 95% confidence interval for this ratio is:
+```{r}
+exp(-confint(fit_mo_ratio_long)["groupcre:typeobject",c(2,1)])
+```
+
+So we have evidence for a decrease in the treated condition, which is not surprising, given that we have seen increase in object examining time in the treated condition while the mouse examination time remained roughly similar.
+

@@ -1,5 +1,5 @@
 ---
-title: "CHRNB2 in striatum - reanalysing data from Muñoz-Manchado et al. 2018 and Gokce et al. 2016"
+title: "CHRNB2 in striatum - reanalysing published RNA-seq data"
 output: 
   html_notebook:
     toc: TRUE
@@ -33,6 +33,9 @@ figures_to_save <- list()
 
 # Muñoz-Manchado et al. - Dataset A
 
+This is data from the publication:
+
+> Muñoz-Manchado et al. 2019, Diversity of Interneurons in the Dorsal Striatum Revealed by Single-Cell RNA Sequencing and PatchSeq, Cell Rep. 24(8): 2179–2190.e7. doi: [10.1016/j.celrep.2018.07.053](https://dx.doi.org/10.1016%2Fj.celrep.2018.07.053)
 
 Load and preprocess the data
 
@@ -394,6 +397,10 @@ Overall, this dataset is not very informative (too many zeroes), this is at leas
 
 # Gokce et al.
 
+This is the dataset from 
+
+> Gokce et al. 2016, Cellular Taxonomy of the Mouse Striatum as Revealed by Single-Cell RNA-Seq, Cell Rep. 2016 Jul 26; 16(4): 1126–1137. doi: [10.1016/j.celrep.2016.06.059](https://dx.doi.org/10.1016%2Fj.celrep.2016.06.059)
+
 The Gokce et al. dataset was enriched for MSN neurons. 
 
 ```{r}
@@ -447,6 +454,10 @@ Gokce_et_al_expression_categories %>% group_by(expression_category) %>% summaris
 
 # Ho et al.
 
+This is the data from:
+
+> Ho et al. 2018, A Guide to Single-Cell Transcriptomics in Adult Rodent Brain: The Medium Spiny Neuron Transcriptome Revisited, Front Cell Neurosci, [doi: 10.3389/fncel.2018.00159](https://doi.org/10.3389/fncel.2018.00159)
+
 ```{r}
 ho_et_al_file <- paste0(downloaded_data_dir, "/GSE112177_processed_data_tpm.txt.gz")
 if(!file.exists(ho_et_al_file)) {
@@ -461,7 +472,6 @@ ho_et_al_tpm <- read_tsv(gzfile(ho_et_al_file), col_types = cols(
 
 ```{r}
 ho_et_al_tpm_long <-  ho_et_al_tpm %>%
-  #t() %>% as.data.frame()
   pivot_longer(cols = -one_of("gene")) 
 
 ho_et_al_tpm_t <- ho_et_al_tpm_long %>%
@@ -474,10 +484,6 @@ Ho et al. didn't provide any classification of cell types, so we use three possi
 ```{r}
 ho_et_al_tpm_t <- ho_et_al_tpm_t %>% mutate(
   cluster_guess = paste(if_else(Bcl11b > 10, "Bcl11b", ""),
-                          #  Npy > 10 ~ "Npy", #Cnpy2 - 4 Npy1r, Npy5r
-                            #Sst > 10 ~ "Sst", # only 1 non-zero
-                            #Pthlh > 5 ~ "Pthlh", # not present
-                           # Pvalb > 3 ~ "Pvalb", # only 1 non-zero
                            if_else(Chat > 0, "Chat", "") ,
                            if_else(Gad1 > 5, "Gad1", ""))
 )
@@ -492,7 +498,7 @@ base_hist <- ho_et_al_tpm_t %>% ggplot(aes(x = Chrnb2)) + geom_histogram(breaks 
 base_hist + facet_wrap(~cluster_guess)
 
 ```
-Once again, we see mostly zeroes, but all populations that larger number of cells also have some cells expressing Chrnb2.
+Once again, we see mostly zeroes, but all populations that have larger number of cells also have some cells expressing Chrnb2.
 
 ```{r}
 ho_et_al_tpm_t %>% group_by(cluster_guess) %>% summarise(count = n(), mean_ch = mean(Chrnb2), mean_log= (mean(log(Chrnb2 + 0.5))), .groups = "drop")
@@ -503,13 +509,7 @@ ho_et_al_tpm_t %>% group_by(cluster_guess) %>% summarise(count = n(), mean_ch = 
 ```{r}
 for(type in c(".svg")) {
   for(plot_name in names(figures_to_save)) {
-    # if(!is.null(widths[[plot_name]])) {
-    #   width = widths[[plot_name]]
-    # } else {
-    #   width = three_groups_width
-    # }
     ggsave(paste0(figures_dir,"/", plot_name, type), figures_to_save[[plot_name]])
-           #, width = width, height = base_height)
   }
 }
 
