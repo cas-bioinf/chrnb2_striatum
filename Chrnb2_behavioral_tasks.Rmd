@@ -29,18 +29,18 @@ options(mc.cores = parallel::detectCores())
 Reading the data:
 
 ```{r}
-head_c1 <- read_excel(here("private_data", "Hole board cohort 1.xlsx"), 
+head_c1 <- read_excel(here("behavioral_data", "Hole board cohort 1.xlsx"), 
                       sheet = "Number of head dippings",
-                      range = "A4:B20") %>% 
+                      range = "A2:B18") %>% 
   rename(mouse = ctrl, n_dippings = `Total number of head dippings`) %>% 
   filter(!(mouse %in% c("average","mt") )) %>% 
   mutate(group = c(rep("ctrl", 10), rep("mt", 4)), cohort = "1")
 
-head_c2 <- read_excel(here("private_data", "Hole board test_cohort 2.xlsx"), 
+head_c2 <- read_excel(here("behavioral_data", "Hole board test_cohort 2.xlsx"), 
                       sheet = "Number of head dippings",
-                      range = "A4:E25") %>% 
-  select(-Jakub, -Revan, -ratio) %>%
-  rename(mouse = ctrl, n_dippings = `Re-scoring Helena`) %>% 
+                      range = "A3:E24") %>% 
+  select(-`Scoring 1`, -`Scoring 2`, -ratio) %>%
+  rename(mouse = ctrl, n_dippings = `Final scoring 3`) %>% 
   filter(!(mouse %in% c("average","mt") ), !is.na(n_dippings)) %>% 
   mutate(group = c(rep("ctrl", 6), rep("mt", 11)), cohort = "2")
 
@@ -110,12 +110,12 @@ it is sensible to treat the upper limit as 3 for all cohorts.
 ```{r}
 read_single_condition_nest <- function(column, cohort) {
   control_range = paste0(column, "4:", column, "13")
-  control <- read_excel(here("private_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
+  control <- read_excel(here("behavioral_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
                         range = control_range, col_names = "amount", col_types = "numeric") %>%
     mutate(group = "control")
 
   cre_range = paste0(column, "15:", column, "25")
-  cre <- read_excel(here("private_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
+  cre <- read_excel(here("behavioral_data", "Nest building cohort 1-4.xlsx"), sheet = "Sheet1",
                         range = cre_range, col_names = "amount", col_types = "numeric") %>%
     mutate(group = "cre")
   
@@ -219,7 +219,7 @@ So the data are consistent with up to 20% increase and a very small decrease in 
 Read the data:
 
 ```{r}
-swim <- read_excel(here("private_data", "FST cohort 1-4.xlsx"), sheet = "Sheet1", range = "A2:B34") %>%
+swim <- read_excel(here("behavioral_data", "FST cohort 1-4.xlsx"), sheet = "Sheet1", range = "A2:B34") %>%
   pivot_longer(everything(), names_to = "group", values_to = "time") %>% filter(!is.na(time)) %>%
   mutate(group = factor(group, levels = c("ctrl", "Beta2-del")))
 ```
@@ -297,7 +297,7 @@ In either case, we can rule out large (roughly more than 20%) changes.
 The data represent examining times for mouse and an inanimate object.
 
 ```{r}
-examining_raw <- read_excel(here("private_data", "Examining times cohort 1 to 4.xlsx"), sheet = "Sheet1", range = "A2:K34", na = c("", "missing video?")) %>%    
+examining_raw <- read_excel(here("behavioral_data", "Examining times cohort 1 to 4.xlsx"), sheet = "Sheet1", range = "A2:K34", na = c("", "missing video?")) %>%    
   transmute(cre.object = `examining object...3`,
             cre.mouse = `examining mouse...2`,
             control.object = `examining object...10`,
