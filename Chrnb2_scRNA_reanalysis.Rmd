@@ -273,7 +273,8 @@ Showing the same results as a table:
 
 ```{r}
 groups %>% 
-  select(group1, group2, lower95, lower50, median, upper50, upper95)
+  select(group1, group2, lower95, lower50, median, upper50, upper95) %>% 
+  mutate(across(one_of(c("lower95", "lower50", "median", "upper50", "upper95")), ~ round(.x, digits = 2))) 
 ```
 
 Computing the widest posterior intervals for Glia vs. others
@@ -311,6 +312,10 @@ rbind(glia_vs_glia, nonglia_vs_nonglia) %>%
 ```
 
 
+```{r}
+chrnb2_for_model %>% group_by(group) %>%
+  summarise(count = n())
+```
 
 
 # Muñoz-Manchado et al. - Dataset B
